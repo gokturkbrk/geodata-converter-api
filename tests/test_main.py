@@ -100,10 +100,27 @@ def test_convert_points_success(points_geojson):
     with zipfile.ZipFile(zip_buffer, 'r') as zf:
         assert set(zf.namelist()) == {'test_points.shp', 'test_points.shx', 'test_points.dbf', 'test_points.prj'}
 
+def test_convert_points_to_gpkg_success(points_geojson):
+    response = client.post(
+        "/convert",
+        json={"geojson": points_geojson, "name": "test_points_gpkg", "format": "gpkg"},
+    )
+    assert response.status_code == 200
+    # Recommended MIME type, could also be application/octet-stream
+    assert response.headers["content-type"] == "application/geopackage+sqlite3"
+    assert response.headers["content-disposition"] == 'attachment; filename="test_points_gpkg.gpkg"'
+    # Further validation could involve trying to open the GPKG file with Fiona or GDAL
+    # For now, we'll assume a 200 OK and correct headers mean success.
+    # To do more:
+    # import fiona
+    # with fiona.BytesCollection(response.content) as source:
+    #     assert len(source) == 1
+    #     # Check CRS, schema, etc.
+
 def test_convert_mixed_polygons_success(mixed_polygons_geojson):
     response = client.post(
         "/convert",
-        json={"geojson": mixed_polygons_geojson, "name": "test_mixed_polygons"},
+        json={"geojson": mixed_polygons_geojson, "name": "test_mixed_polygons"}, # Default to shp
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
@@ -111,6 +128,16 @@ def test_convert_mixed_polygons_success(mixed_polygons_geojson):
     zip_buffer = io.BytesIO(response.content)
     with zipfile.ZipFile(zip_buffer, 'r') as zf:
         assert set(zf.namelist()) == {'test_mixed_polygons.shp', 'test_mixed_polygons.shx', 'test_mixed_polygons.dbf', 'test_mixed_polygons.prj'}
+
+def test_convert_mixed_polygons_to_gpkg_success(mixed_polygons_geojson):
+    response = client.post(
+        "/convert",
+        json={"geojson": mixed_polygons_geojson, "name": "test_mixed_polygons_gpkg", "format": "gpkg"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/geopackage+sqlite3"
+    assert response.headers["content-disposition"] == 'attachment; filename="test_mixed_polygons_gpkg.gpkg"'
+    # As above, further validation of the GPKG content could be added.
 
 def test_convert_invalid_geojson():
     response = client.post(
@@ -127,6 +154,13 @@ def test_convert_invalid_name(points_geojson):
     )
     assert response.status_code == 400
     assert "Invalid name" in response.json()["detail"]
+
+def test_convert_invalid_format(points_geojson):
+    response = client.post(
+        "/convert",
+        json={"geojson": points_geojson, "name": "test_invalid_format", "format": "invalid_format"},
+    )
+    assert response.status_code == 422 # FastAPI's validation error for Literal
 
 def test_convert_no_features():
     response = client.post(
