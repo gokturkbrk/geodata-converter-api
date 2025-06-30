@@ -9,6 +9,7 @@ import shutil
 import logging
 import fiona
 from fiona.crs import from_epsg
+from fastapi import BackgroundTasks
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Literal
@@ -39,8 +40,15 @@ WGS84_PRJ = 'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",' \
 
 logging.basicConfig(level=logging.INFO)
 
+def cleanup_temp_dir(temp_dir_path: str):
+    try:
+        shutil.rmtree(temp_dir_path)
+        logging.info(f"Successfully cleaned up temp directory: {temp_dir_path}")
+    except Exception as e:
+        logging.error(f"Error cleaning up temp directory {temp_dir_path}: {e}")
+
 @app.post("/convert")
-async def convert_geojson(request: ConversionRequest):
+async def convert_geojson(request: ConversionRequest, background_tasks: BackgroundTasks):
     geojson = request.geojson
     name = request.name
     output_format = request.format
@@ -149,7 +157,7 @@ async def convert_geojson(request: ConversionRequest):
             return StreamingResponse(
                 zip_buffer,
                 media_type="application/zip",
-                headers={"Content-Disposition": f"attachment; filename={name}.zip"}
+                headers={"Content-Disposition": f'attachment; filename="{name}.zip"'}
             )
 
         elif output_format == 'gpkg':
@@ -191,27 +199,29 @@ async def convert_geojson(request: ConversionRequest):
                     else:
                         logging.warning(f"Skipping feature with mismatched geometry for GPKG: {feature.get('geometry', {}).get('type')}")
 
+            background_tasks.add_task(cleanup_temp_dir, temp_dir)
             return FileResponse(
                 gpkg_path,
                 media_type="application/geopackage+sqlite3", # Recommended MIME type
-                # media_type="application/octet-stream", # Alternative
-                headers={"Content-Disposition": f"attachment; filename={name}.gpkg"}
+                filename=f"{name}.gpkg", # Let FileResponse handle Content-Disposition quoting
+                # headers={"Content-Disposition": f'attachment; filename="{name}.gpkg"'}, # Manual override
+                background=background_tasks
             )
 
     except Exception as e:
         logging.error(f"Exception during conversion: {e}")
         # Clean up the temporary directory in case of an early exit due to error
+        # This immediate cleanup is important for non-FileResponse paths or errors before FileResponse
         if os.path.exists(temp_dir):
              shutil.rmtree(temp_dir)
         raise fastapi.HTTPException(status_code=500, detail=f"An error occurred during conversion: {str(e)}")
     finally:
-        # Ensure cleanup happens unless an error already removed it or it's a FileResponse case
-        # For FileResponse, the file is cleaned up after being sent.
-        # A more robust solution for FileResponse cleanup might involve background tasks if not handled by FastAPI.
-        if output_format == 'shp' and os.path.exists(temp_dir): # Only clean for shp here, gpkg handled by FileResponse
-            shutil.rmtree(temp_dir)
-        elif output_format == 'gpkg' and not isinstance(e if 'e' in locals() else None, FileResponse):
-            # If it's gpkg and an error occurred before FileResponse, or if FileResponse itself failed.
-            # This logic might need refinement depending on how FileResponse handles cleanup on error.
-            if os.path.exists(temp_dir): # Check again, as error handling might have already cleaned it.
-                shutil.rmtree(temp_dir)
+        # General cleanup for SHP format if it hasn't been returned via StreamingResponse (which would imply success)
+        # For GPKG, FileResponse with background task handles its own cleanup on success.
+        # This finally block primarily handles cleanup for SHP or if an error occurred before GPKG's FileResponse.
+        if output_format == 'shp':
+            if os.path.exists(temp_dir) and not any(isinstance(res, StreamingResponse) for res in locals().values()):
+                 shutil.rmtree(temp_dir)
+        # For GPKG, if an error occurred *before* FileResponse was prepared, temp_dir might still exist.
+        # The `except` block already handles this. If FileResponse is initiated, it should handle cleanup.
+        # No specific additional cleanup for GPKG here to avoid conflict with FileResponse's background task.
