@@ -154,10 +154,12 @@ async def convert_geojson(request: ConversionRequest, background_tasks: Backgrou
                         zf.write(filepath, arcname=f"{name}.{ext}")
             zip_buffer.seek(0)
 
+            background_tasks.add_task(cleanup_temp_dir, temp_dir)
             return StreamingResponse(
                 zip_buffer,
                 media_type="application/zip",
-                headers={"Content-Disposition": f'attachment; filename="{name}.zip"'}
+                headers={"Content-Disposition": f'attachment; filename="{name}.zip"'},
+                background=background_tasks
             )
 
         elif output_format == 'gpkg':
@@ -181,10 +183,14 @@ async def convert_geojson(request: ConversionRequest, background_tasks: Backgrou
                 'str': 'str',
                 'int': 'int',
                 'float': 'float',
-                'bool': 'bool'
+                'bool': 'int'
                 # Add other mappings if necessary
             }
             schema['properties'] = {k: type_mapping.get(v, 'str') for k, v in schema['properties'].items()}
+            # Convert boolean property values to integers (0/1) in features
+            for feature in features:
+                if 'properties' in feature:
+                    feature['properties'] = {k: (int(v) if isinstance(v, bool) else v) for k, v in feature['properties'].items()}
 
 
             with fiona.open(gpkg_path, 'w', driver='GPKG', schema=schema, crs=from_epsg(4326)) as sink:
@@ -215,13 +221,3 @@ async def convert_geojson(request: ConversionRequest, background_tasks: Backgrou
         if os.path.exists(temp_dir):
              shutil.rmtree(temp_dir)
         raise fastapi.HTTPException(status_code=500, detail=f"An error occurred during conversion: {str(e)}")
-    finally:
-        # General cleanup for SHP format if it hasn't been returned via StreamingResponse (which would imply success)
-        # For GPKG, FileResponse with background task handles its own cleanup on success.
-        # This finally block primarily handles cleanup for SHP or if an error occurred before GPKG's FileResponse.
-        if output_format == 'shp':
-            if os.path.exists(temp_dir) and not any(isinstance(res, StreamingResponse) for res in locals().values()):
-                 shutil.rmtree(temp_dir)
-        # For GPKG, if an error occurred *before* FileResponse was prepared, temp_dir might still exist.
-        # The `except` block already handles this. If FileResponse is initiated, it should handle cleanup.
-        # No specific additional cleanup for GPKG here to avoid conflict with FileResponse's background task.
