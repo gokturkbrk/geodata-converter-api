@@ -1,194 +1,165 @@
-# GeoJSON to Shapefile & GeoPackage Conversion API
+# Geodata Converter API
 
-This is a FastAPI application that converts GeoJSON data to either a Shapefile (zipped) or a GeoPackage file.
+A FastAPI application that converts GeoJSON data into zipped Shapefiles or GeoPackage (GPKG) files. Includes robust validation, support for mixed-geometry flattening, automatic resource cleanup, and a clean API interface.
+
+---
 
 ## Features
 
-- Converts GeoJSON to Shapefile (`.shp`, `.shx`, `.dbf`, `.prj`) or GeoPackage (`.gpkg`).
-- Packages Shapefile components into a single `.zip` file. GeoPackage is returned as a single `.gpkg` file.
-- Validates input GeoJSON and parameters.
-- Handles different geometry types (Point, LineString, Polygon and their Multi* versions). For Shapefile output, all features in a single request must be of the same primary geometry type. For GeoPackage, this is also generally true as Fiona schema is derived from the first feature.
-- Handles mixed collections of `Polygon`/`MultiPolygon` and `LineString`/`MultiLineString` by flattening them into a single geometry type for processing.
-- Skips unsupported or mismatched geometry types within a single request.
+- **Convert GeoJSON to Shapefile or GPKG:**  
+  Accepts a GeoJSON FeatureCollection and outputs either a zipped Shapefile (`.shp`, `.shx`, `.dbf`, `.prj`) or a GeoPackage (`.gpkg`).
+- **Mixed Geometry Handling:**  
+  Supports mixed `Polygon`/`MultiPolygon` and `LineString`/`MultiLineString` collections by flattening multi-geometries into their single counterparts.
+- **Boolean Property Support:**  
+  Boolean properties in GeoJSON are automatically converted to integer fields (`0`/`1`) in GPKG output for compatibility.
+- **Input Validation:**  
+  Validates GeoJSON structure, feature presence, and output file name for security and correctness.
+- **CORS Support:**  
+  Allows cross-origin requests from configurable origins (e.g., `localhost:5143`).
+- **Automatic Resource Cleanup:**  
+  Uses FastAPI background tasks to clean up temporary files after response delivery.
+- **Comprehensive Testing:**  
+  Includes a full test suite using `pytest` and `httpx`.
 
-## Setup and Running the Application
+---
 
-### 1. Prerequisites
+## Requirements
 
 - Python 3.7+
+- See `requirements.txt` for dependencies.
 
-### 2. Installation
+---
 
-1.  **Clone the repository (or download the files):**
-    ```bash
-    git clone <repository_url>
-    cd geojson2shp-api
-    ```
+## Installation
 
-2.  **Create a virtual environment (recommended):**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-    ```
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/gokturkbrk/geodata-converter-api.git
+   cd geodata-converter-api
+   ```
 
-3.  **Install the dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+2. **Create and activate a virtual environment (recommended):**
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
 
-### 3. Running the API
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-To run the API server, use `uvicorn`:
+---
+
+## Running the API
+
+Start the server with:
 
 ```bash
 uvicorn main:app --reload
 ```
 
-The API will be available at `http://127.0.0.1:8000`.
+The API will be available at [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
-### 4. Running Tests
+Interactive documentation is available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
-The project uses `pytest` for testing. To run the tests, first ensure you have installed the development dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Then, run `pytest` from the root directory:
-
-```bash
-pytest
-```
+---
 
 ## API Usage
 
-You can access the interactive API documentation (Swagger UI) at `http://127.0.0.1:8000/docs`.
+### Endpoint
 
-### Endpoint: `/convert`
+`POST /convert`
 
-- **Method:** `POST`
-- **Description:** Converts a GeoJSON object to a zipped Shapefile or a GeoPackage file.
-- **Request Body:**
+### Request Body
 
-  ```json
-  {
+```json
+{
+  "geojson": { ... },   // A valid GeoJSON FeatureCollection
+  "name": "output_name", // Desired base name for output files (no slashes or '..')
+  "format": "shp"        // Optional: "shp" (default) or "gpkg"
+}
+```
+
+### Example Request
+
+```bash
+curl -X POST "http://127.0.0.1:8000/convert" \
+  -H "Content-Type: application/json" \
+  -d '{
     "geojson": {
       "type": "FeatureCollection",
       "features": [
         {
           "type": "Feature",
-          "geometry": {
-            "type": "Point",
-            "coordinates": [102.0, 0.5]
-          },
-          "properties": {
-            "prop0": "value0"
-          }
+          "geometry": { "type": "Polygon", "coordinates": [[[0,0],[0,1],[1,1],[0,0]]] },
+          "properties": { "id": 1, "active": true }
+        },
+        {
+          "type": "Feature",
+          "geometry": { "type": "MultiPolygon", "coordinates": [[[[10,10],[10,11],[11,11],[10,10]]]] },
+          "properties": { "id": 2, "active": false }
         }
       ]
     },
-    "name": "my_data",
-    "format": "shp"
-  }
-  ```
-
-- **Parameters:**
-  - `geojson` (object, required): A valid GeoJSON `FeatureCollection`.
-  - `name` (string, required): The desired base name for the output file(s).
-  - `format` (string, optional): The desired output format. Can be `"shp"` (default) or `"gpkg"`.
-
-- **Success Response:**
-  - **Code:** `200 OK`
-  - **Content:**
-    - If `format` is `"shp"`: A zip file (`application/zip`) named `{name}.zip` containing the shapefile components.
-    - If `format` is `"gpkg"`: A GeoPackage file (`application/geopackage+sqlite3`) named `{name}.gpkg`.
-
-- **Error Responses:**
-  - **Code:** `400 Bad Request`
-    - If the `geojson` is invalid or missing.
-    - If the `name` is invalid.
-    - If the GeoJSON contains no features or unsupported geometry types for the selected format.
-  - **Code:** `422 Unprocessable Entity`
-    - If the `format` parameter is invalid.
-  - **Code:** `500 Internal Server Error`
-    - If an unexpected error occurs during the conversion process.
-
-### Example `curl` commands:
-
-**For Shapefile (default):**
-
-```bash
-curl -X 'POST' \
-  'http://127.0.0.1:8000/convert' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "geojson": {
-    "type": "FeatureCollection",
-    "name": "test-points",
-    "features": [
-      {
-        "type": "Feature",
-        "properties": { "id": 1 },
-        "geometry": {
-          "type": "Point",
-          "coordinates": [ -122.4194, 37.7749 ]
-        }
-      },
-      {
-        "type": "Feature",
-        "properties": { "id": 2 },
-        "geometry": {
-          "type": "Point",
-          "coordinates": [ -74.0060, 40.7128 ]
-        }
-      }
-    ]
-  },
-  "name": "points_shapefile"
-}' \
---output points_shapefile.zip
+    "name": "my_shapes",
+    "format": "gpkg"
+  }' --output my_shapes.gpkg
 ```
 
-## Limitations & Behavior
+### Response
 
---output points_shapefile.zip
-```
+- **200 OK:**  
+  - For `shp`: Returns a `.zip` file containing the shapefile components.
+  - For `gpkg`: Returns a `.gpkg` file.
+- **400 Bad Request:**  
+  - Invalid GeoJSON, missing features, or invalid name.
+- **500 Internal Server Error:**  
+  - Unexpected error during conversion.
 
-**For GeoPackage:**
+---
 
-```bash
-curl -X 'POST' \
-  'http://127.0.0.1:8000/convert' \
-  -H 'accept: application/json' \ # Or application/geopackage+sqlite3
-  -H 'Content-Type: application/json' \
-  -d '{
-  "geojson": {
-    "type": "FeatureCollection",
-    "name": "test-points-gpkg",
-    "features": [
-      {
-        "type": "Feature",
-        "properties": { "id": 1, "name": "Point A" },
-        "geometry": {
-          "type": "Point",
-          "coordinates": [ -100, 40 ]
-        }
-      }
-    ]
-  },
-  "name": "points_data",
-  "format": "gpkg"
-}' \
---output points_data.gpkg
-```
+## Behavior & Limitations
 
-## Limitations & Behavior
+- **Geometry Handling:**  
+  - Mixed `Polygon`/`MultiPolygon` and `LineString`/`MultiLineString` are flattened to single geometry types.
+  - The output file's geometry type is determined by the first feature after flattening. Features with other geometry types are skipped.
+- **Properties Schema:**  
+  - Attribute fields are based on the first feature's properties.
+  - Boolean properties are converted to integer fields (`0`/`1`) in GPKG output.
+- **Shapefile Field Names:**  
+  - Field names are truncated to 10 characters due to the Shapefile format limitation.
+- **File Name Validation:**  
+  - The `name` parameter must not contain slashes or `..` for security.
+- **Resource Cleanup:**  
+  - Temporary files are always cleaned up after the response is sent.
 
-- **Geometry Handling:**
-  - The service can process a mix of `Polygon` and `MultiPolygon` features, or a mix of `LineString` and `MultiLineString` features in a single request. `Multi*` geometries are automatically flattened into their singular counterparts (e.g., `MultiPolygon` becomes multiple `Polygon` features).
-  - The output file's geometry type (and schema for GeoPackage) is determined by the first feature in the processed list. Any feature whose geometry type does not match the first feature's type will be skipped. For example, if the first feature is a `Polygon`, all `Point` and `LineString` features in the request will generally be ignored or cause issues.
+---
 
-- **Properties Schema:** The attribute fields for the output file are created based on the properties of the *first* feature in the GeoJSON. All subsequent features are expected to have a compatible properties structure.
+## Running Tests
 
-- **Shapefile Field Names:** The Shapefile format limits field names to 10 characters. Property keys from your GeoJSON that are longer than this will be truncated when exporting to Shapefile. This limitation does not apply to GeoPackage.
+1. **Install test dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Run the test suite:**
+   ```bash
+   pytest
+   ```
+
+---
+
+## Repository
+
+[https://github.com/gokturkbrk/geodata-converter-api](https://github.com/gokturkbrk/geodata-converter-api)
+
+---
+
+## License
+
+MIT License — feel free to use, modify, and distribute.
+
+---
+
+If you have any questions or encounter issues, please open an issue or contact the maintainer.
