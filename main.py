@@ -15,7 +15,7 @@ from fastapi import BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from typing import Literal, Optional
+from typing import Literal
 
 app = fastapi.FastAPI()
 
@@ -109,7 +109,7 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
                     break
         
         if not first_geom_type:
-             raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
+            raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
 
         shapetype_map = {
             "Point": shapefile.POINT,
@@ -196,10 +196,8 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
                         # Check geometry match (using base type)
                         f_type = f_geom.get('type')
                         if f_type != base_geom_type:
-                             # Allow Multi -> Single mapping check
-                             pass # We already flattened, so f_type should be Polygon if base is Polygon
-                             if f_type != base_geom_type:
-                                 continue
+                            logging.warning(f"Skipping feature with mismatched geometry: {f_type} (expected {base_geom_type})")
+                            continue
 
                         w.shape(f_geom)
                         
@@ -240,7 +238,7 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
                     break
         
         if not first_geom_type:
-             raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
+            raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
 
         # Flattening logic implies we target the single type
         target_geom_type = first_geom_type
@@ -297,10 +295,10 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
                         # Validate geometry type matches schema
                         if feat['geometry']['type'] != target_geom_type:
                             continue
-                            
+                        
                         # Convert bools
                         if 'properties' in feat:
-                             feat['properties'] = {k: (int(v) if isinstance(v, bool) else v) for k, v in feat['properties'].items()}
+                            feat['properties'] = {k: (int(v) if isinstance(v, bool) else v) for k, v in feat['properties'].items()}
                         
                         try:
                             sink.write(feat)

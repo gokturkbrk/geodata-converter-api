@@ -1,10 +1,10 @@
-import pytest
 from fastapi.testclient import TestClient
 from main import app
 import zipfile
 import io
 import shapefile
-import fiona
+import shutil
+import json
 import os
 
 client = TestClient(app)
@@ -46,25 +46,27 @@ def test_schema_inference_heterogeneous_features():
     
     # Verify Shapefile content
     zip_content = io.BytesIO(response.content)
-    with zipfile.ZipFile(zip_content) as zf:
-        # Extract to a temp dir to read with pyshp
-        zf.extractall("temp_test_shp")
-        
-        sf = shapefile.Reader("temp_test_shp/test_schema.shp")
-        fields = [f[0] for f in sf.fields][1:] # Skip DeletionFlag
-        
-        # Check if both fields exist
-        assert "only_in_fi" in fields or "only_in_first" in fields # truncated
-        assert "only_in_se" in fields or "only_in_second" in fields # truncated
-        
-        records = sf.records()
-        assert len(records) == 2
-        # Check values
-        assert len(records[0]) >= 3 # id, only_in_first, only_in_second
-        
-        sf.close()
-        import shutil
-        shutil.rmtree("temp_test_shp")
+    try:
+        with zipfile.ZipFile(zip_content) as zf:
+            # Extract to a temp dir to read with pyshp
+            zf.extractall("temp_test_shp")
+            
+            sf = shapefile.Reader("temp_test_shp/test_schema.shp")
+            fields = [f[0] for f in sf.fields][1:] # Skip DeletionFlag
+            
+            # Check if both fields exist
+            assert "only_in_fi" in fields or "only_in_first" in fields # truncated
+            assert "only_in_se" in fields or "only_in_second" in fields # truncated
+            
+            records = sf.records()
+            assert len(records) == 2
+            # Check values
+            assert len(records[0]) >= 3 # id, only_in_first, only_in_second
+            
+            sf.close()
+    finally:
+        if os.path.exists("temp_test_shp"):
+            shutil.rmtree("temp_test_shp")
 
 def test_schema_inference_type_promotion():
     """
@@ -109,18 +111,20 @@ def test_schema_inference_type_promotion():
     assert response.status_code == 200
     
     zip_content = io.BytesIO(response.content)
-    with zipfile.ZipFile(zip_content) as zf:
-        zf.extractall("temp_test_types")
-        sf = shapefile.Reader("temp_test_types/test_types.shp")
-        
-        # Check field types
-        # Field structure: (name, type, size, decimal)
-        # Type 'N' = number (int/float), 'C' = character (string)
-        fields_dict = {f[0]: f[1] for f in sf.fields[1:]}
-        
-        assert fields_dict.get('mixed_num') == 'N' or fields_dict.get('mixed_num') == 'F'
-        assert fields_dict.get('mixed_str') == 'C'
-        
-        sf.close()
-        import shutil
-        shutil.rmtree("temp_test_types")
+    try:
+        with zipfile.ZipFile(zip_content) as zf:
+            zf.extractall("temp_test_types")
+            sf = shapefile.Reader("temp_test_types/test_types.shp")
+            
+            # Check field types
+            # Field structure: (name, type, size, decimal)
+            # Type 'N' = number (int/float), 'C' = character (string)
+            fields_dict = {f[0]: f[1] for f in sf.fields[1:]}
+            
+            assert fields_dict.get('mixed_num') == 'N' or fields_dict.get('mixed_num') == 'F'
+            assert fields_dict.get('mixed_str') == 'C'
+            
+            sf.close()
+    finally:
+        if os.path.exists("temp_test_types"):
+            shutil.rmtree("temp_test_types")
