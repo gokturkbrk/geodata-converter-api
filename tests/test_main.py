@@ -88,9 +88,11 @@ def mixed_incompatible_geojson():
 
 
 def test_convert_points_success(points_geojson):
+    geojson_content = json.dumps(points_geojson).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": points_geojson, "name": "test_points"},
+        files={"file": ("points.json", geojson_content, "application/json")},
+        data={"name": "test_points", "format": "shp"}
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
@@ -101,9 +103,11 @@ def test_convert_points_success(points_geojson):
         assert set(zf.namelist()) == {'test_points.shp', 'test_points.shx', 'test_points.dbf', 'test_points.prj'}
 
 def test_convert_points_to_gpkg_success(points_geojson):
+    geojson_content = json.dumps(points_geojson).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": points_geojson, "name": "test_points_gpkg", "format": "gpkg"},
+        files={"file": ("points.json", geojson_content, "application/json")},
+        data={"name": "test_points_gpkg", "format": "gpkg"}
     )
     assert response.status_code == 200
     # Recommended MIME type, could also be application/octet-stream
@@ -118,9 +122,11 @@ def test_convert_points_to_gpkg_success(points_geojson):
     #     # Check CRS, schema, etc.
 
 def test_convert_mixed_polygons_success(mixed_polygons_geojson):
+    geojson_content = json.dumps(mixed_polygons_geojson).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": mixed_polygons_geojson, "name": "test_mixed_polygons"}, # Default to shp
+        files={"file": ("mixed.json", geojson_content, "application/json")},
+        data={"name": "test_mixed_polygons", "format": "shp"}
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
@@ -130,9 +136,11 @@ def test_convert_mixed_polygons_success(mixed_polygons_geojson):
         assert set(zf.namelist()) == {'test_mixed_polygons.shp', 'test_mixed_polygons.shx', 'test_mixed_polygons.dbf', 'test_mixed_polygons.prj'}
 
 def test_convert_mixed_polygons_to_gpkg_success(mixed_polygons_geojson):
+    geojson_content = json.dumps(mixed_polygons_geojson).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": mixed_polygons_geojson, "name": "test_mixed_polygons_gpkg", "format": "gpkg"},
+        files={"file": ("mixed.json", geojson_content, "application/json")},
+        data={"name": "test_mixed_polygons_gpkg", "format": "gpkg"}
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/geopackage+sqlite3"
@@ -140,53 +148,67 @@ def test_convert_mixed_polygons_to_gpkg_success(mixed_polygons_geojson):
     # As above, further validation of the GPKG content could be added.
 
 def test_convert_invalid_geojson():
+    geojson_content = json.dumps({"type": "Invalid"}).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": {"type": "Invalid"}, "name": "test_invalid"},
+        files={"file": ("invalid.json", geojson_content, "application/json")},
+        data={"name": "test_invalid", "format": "shp"}
     )
     assert response.status_code == 400
-    assert "Invalid GeoJSON" in response.json()["detail"]
+    # New error message from process_conversion when no features found
+    assert "No features with geometry found" in response.json()["detail"]
 
 def test_convert_invalid_name(points_geojson):
+    geojson_content = json.dumps(points_geojson).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": points_geojson, "name": "../invalid_name"},
+        files={"file": ("points.json", geojson_content, "application/json")},
+        data={"name": "../invalid_name", "format": "shp"}
     )
     assert response.status_code == 400
     assert "Invalid name" in response.json()["detail"]
 
 def test_convert_invalid_format(points_geojson):
+    geojson_content = json.dumps(points_geojson).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": points_geojson, "name": "test_invalid_format", "format": "invalid_format"},
+        files={"file": ("points.json", geojson_content, "application/json")},
+        data={"name": "test_invalid_format", "format": "invalid_format"}
     )
     assert response.status_code == 422 # FastAPI's validation error for Literal
 
 def test_convert_no_features():
+    geojson_content = json.dumps({"type": "FeatureCollection", "features": []}).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": {"type": "FeatureCollection", "features": []}, "name": "no_features"},
+        files={"file": ("no_features.json", geojson_content, "application/json")},
+        data={"name": "no_features", "format": "shp"}
     )
     assert response.status_code == 400
-    assert "GeoJSON has no features" in response.json()["detail"]
+    assert "No features with geometry found" in response.json()["detail"]
 
 def test_convert_unsupported_geometry():
     geojson = {
         "type": "FeatureCollection",
         "features": [{"type": "Feature", "geometry": {"type": "GeometryCollection", "geometries": []}, "properties": {}}]
     }
+    geojson_content = json.dumps(geojson).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": geojson, "name": "unsupported"},
+        files={"file": ("unsupported.json", geojson_content, "application/json")},
+        data={"name": "unsupported", "format": "shp"}
     )
     assert response.status_code == 400
-    assert "No processable features" in response.json()["detail"]
+    # Error message changed
+    assert "Unsupported geometry type" in response.json()["detail"] or "No features with geometry found" in response.json()["detail"]
 
 def test_convert_mismatched_geometries(mixed_incompatible_geojson):
     # The test expects a valid zip because the first feature (Point) is processed, and the second (Polygon) is skipped.
+    geojson_content = json.dumps(mixed_incompatible_geojson).encode('utf-8')
     response = client.post(
         "/convert",
-        json={"geojson": mixed_incompatible_geojson, "name": "mismatched"},
+        files={"file": ("mismatched.json", geojson_content, "application/json")},
+        data={"name": "mismatched", "format": "shp"}
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"

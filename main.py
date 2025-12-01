@@ -8,11 +8,14 @@ import tempfile
 import shutil
 import logging
 import fiona
+import ijson
+from decimal import Decimal
 from fiona.crs import from_epsg
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Literal
+from fastapi.concurrency import run_in_threadpool
+from typing import Literal, Optional
 
 app = fastapi.FastAPI()
 
@@ -28,11 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class ConversionRequest(pydantic.BaseModel):
-    geojson: dict
-    name: str
-    format: Literal['shp', 'gpkg'] = 'shp'
-
 # WGS84 projection .prj file content
 WGS84_PRJ = 'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",' \
             'SPHEROID["WGS_1984",6378137,298.257223563]],' \
@@ -47,177 +45,317 @@ def cleanup_temp_dir(temp_dir_path: str):
     except Exception as e:
         logging.error(f"Error cleaning up temp directory {temp_dir_path}: {e}")
 
-@app.post("/convert")
-async def convert_geojson(request: ConversionRequest, background_tasks: BackgroundTasks):
-    geojson = request.geojson
-    name = request.name
-    output_format = request.format
-
-    if not geojson or 'features' not in geojson or not isinstance(geojson['features'], list):
-        raise fastapi.HTTPException(status_code=400, detail="Invalid GeoJSON. Must be a FeatureCollection.")
-
-    if not name or not isinstance(name, str) or "/" in name or "\\" in name or ".." in name:
-        raise fastapi.HTTPException(status_code=400, detail="Invalid name.")
-
-    features = geojson.get('features', [])
-    if not features:
-        raise fastapi.HTTPException(status_code=400, detail="GeoJSON has no features.")
-
-    def flatten_features(features):
-        flattened = []
+def infer_schema_streaming(input_path: str):
+    """
+    First pass: Stream through the file to infer schema from all features.
+    """
+    properties_schema = {}
+    
+    with open(input_path, 'rb') as f:
+        # ijson.items yields objects from the stream. 
+        # We assume standard GeoJSON structure: root -> features -> item
+        features = ijson.items(f, 'features.item')
         for feature in features:
-            geom = feature.get('geometry')
-            if not geom:
+            props = feature.get('properties')
+            if not props:
                 continue
-            geom_type = geom.get('type')
-            coordinates = geom.get('coordinates')
-            properties = feature.get('properties')
+            for key, value in props.items():
+                if value is None:
+                    continue
+                
+                # Normalize type
+                val_type = type(value)
+                if val_type == bool:
+                    val_type = int
+                elif val_type == Decimal:
+                    val_type = float
+                
+                current_type = properties_schema.get(key)
+                
+                if current_type is None:
+                    properties_schema[key] = val_type
+                elif current_type == val_type:
+                    continue
+                elif {current_type, val_type} <= {int, float}:
+                    properties_schema[key] = float
+                else:
+                    properties_schema[key] = str
+                    
+    return properties_schema
 
-            if geom_type == 'MultiPolygon':
-                for polygon_coords in coordinates:
-                    flattened.append({
-                        'type': 'Feature',
-                        'geometry': {'type': 'Polygon', 'coordinates': polygon_coords},
-                        'properties': properties
-                    })
-            elif geom_type == 'MultiLineString':
-                for line_coords in coordinates:
-                    flattened.append({
-                        'type': 'Feature',
-                        'geometry': {'type': 'LineString', 'coordinates': line_coords},
-                        'properties': properties
-                    })
-            elif geom_type in ['Polygon', 'LineString', 'Point', 'MultiPoint']:
-                flattened.append(feature)
-            else:
-                logging.warning(f"Skipped unsupported geometry type: {geom_type}")
-        return flattened
+def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output_format: str):
+    """
+    Synchronous function to handle the CPU-bound conversion process.
+    """
+    # 1. Infer Schema (Pass 1)
+    properties_schema = infer_schema_streaming(input_geojson_path)
+    
+    # We need to get the first geometry type to validate consistency
+    # We can do this by peeking or just checking during the second pass.
+    # For simplicity and efficiency, let's start the second pass.
+    
+    if output_format == 'shp':
+        shapefile_path = os.path.join(temp_dir, name)
+        
+        # We need to determine the shape type before opening the writer.
+        # Let's scan for the first valid geometry.
+        first_geom_type = None
+        with open(input_geojson_path, 'rb') as f:
+            features = ijson.items(f, 'features.item')
+            for feature in features:
+                geom = feature.get('geometry')
+                if geom and geom.get('type'):
+                    first_geom_type = geom.get('type')
+                    break
+        
+        if not first_geom_type:
+             raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
 
-    features = flatten_features(features)
-    if not features:
-        raise fastapi.HTTPException(status_code=400, detail="No processable features found in GeoJSON.")
+        shapetype_map = {
+            "Point": shapefile.POINT,
+            "MultiPoint": shapefile.MULTIPOINT,
+            "LineString": shapefile.POLYLINE,
+            "MultiLineString": shapefile.POLYLINE, # Flattened
+            "Polygon": shapefile.POLYGON,
+            "MultiPolygon": shapefile.POLYGON, # Flattened
+        }
+        
+        # Handle flattening logic mapping
+        # If it's MultiPolygon, we treat it as Polygon for the shapefile type, 
+        # but we must flatten the features later.
+        base_geom_type = first_geom_type
+        if base_geom_type == 'MultiPolygon':
+            base_geom_type = 'Polygon'
+        elif base_geom_type == 'MultiLineString':
+            base_geom_type = 'LineString'
 
-    temp_dir = tempfile.mkdtemp()
-    try:
-        if output_format == 'shp':
-            shapefile_path = os.path.join(temp_dir, name)
-            first_geom_type = features[0].get('geometry', {}).get('type')
-            if not first_geom_type:
-                raise fastapi.HTTPException(status_code=400, detail="First feature has no geometry type.")
+        shape_type = shapetype_map.get(base_geom_type)
+        if shape_type is None:
+            raise fastapi.HTTPException(status_code=400, detail=f"Unsupported geometry type: {first_geom_type}")
 
-            shapetype_map = {
-                "Point": shapefile.POINT,
-                "MultiPoint": shapefile.MULTIPOINT,
-                "LineString": shapefile.POLYLINE,
-                "Polygon": shapefile.POLYGON,
-            }
-            shape_type = shapetype_map.get(first_geom_type)
-            if shape_type is None:
-                raise fastapi.HTTPException(status_code=400, detail=f"Unsupported geometry type for Shapefile: {first_geom_type}")
+        with shapefile.Writer(shapefile_path, shapeType=shape_type) as w:
+            # Define fields
+            field_names = []
+            seen_fields = set()
+            
+            for key, val_type in properties_schema.items():
+                # Handle 10 char limit and uniqueness
+                base_name = key[:10]
+                final_name = base_name
+                counter = 1
+                while final_name in seen_fields:
+                    suffix = str(counter)
+                    final_name = base_name[:10-len(suffix)] + suffix
+                    counter += 1
+                
+                seen_fields.add(final_name)
+                field_names.append(key)
 
-            with shapefile.Writer(shapefile_path, shapeType=shape_type) as w:
-                first_props = features[0].get('properties', {})
-                # Define fields based on the properties of the first feature
-                field_names = []
-                if first_props: # Ensure there are properties to define fields
-                    for fname, val in first_props.items():
-                        field_names.append(fname)
-                        if isinstance(val, int):
-                            w.field(fname, 'N')
-                        elif isinstance(val, float):
-                            w.field(fname, 'F')
-                        else:
-                            w.field(fname, 'C', size=254)
+                if val_type == int:
+                    w.field(final_name, 'N')
+                elif val_type == float:
+                    w.field(final_name, 'F', size=18, decimal=10)
+                else:
+                    w.field(final_name, 'C', size=254)
 
+            # Pass 2: Write features
+            with open(input_geojson_path, 'rb') as f:
+                features = ijson.items(f, 'features.item')
                 for feature in features:
                     geom = feature.get('geometry')
+                    if not geom:
+                        continue
+                        
+                    geom_type = geom.get('type')
+                    coordinates = geom.get('coordinates')
                     props = feature.get('properties', {})
 
-                    if not geom or geom.get('type') != first_geom_type:
-                        logging.warning(f"Skipping feature with mismatched geometry for Shapefile: {geom.get('type') if geom else 'None'}")
-                        continue
+                    # Flattening Logic
+                    features_to_write = []
+                    if geom_type == 'MultiPolygon':
+                        for poly_coords in coordinates:
+                            features_to_write.append({
+                                'type': 'Feature',
+                                'geometry': {'type': 'Polygon', 'coordinates': poly_coords},
+                                'properties': props
+                            })
+                    elif geom_type == 'MultiLineString':
+                        for line_coords in coordinates:
+                            features_to_write.append({
+                                'type': 'Feature',
+                                'geometry': {'type': 'LineString', 'coordinates': line_coords},
+                                'properties': props
+                            })
+                    else:
+                        features_to_write.append(feature)
 
-                    w.shape(geom)
-                    # Prepare record values, ensuring order matches field_names and handling missing properties
-                    record_values = [props.get(fn) for fn in field_names]
-                    w.record(*record_values)
+                    for feat in features_to_write:
+                        f_geom = feat.get('geometry')
+                        f_props = feat.get('properties', {})
+                        
+                        # Check geometry match (using base type)
+                        f_type = f_geom.get('type')
+                        if f_type != base_geom_type:
+                             # Allow Multi -> Single mapping check
+                             pass # We already flattened, so f_type should be Polygon if base is Polygon
+                             if f_type != base_geom_type:
+                                 continue
+
+                        w.shape(f_geom)
+                        
+                        record_values = []
+                        for key in field_names:
+                            val = f_props.get(key)
+                            if val is None:
+                                record_values.append(None)
+                            elif properties_schema[key] == int and isinstance(val, bool):
+                                record_values.append(int(val))
+                            else:
+                                record_values.append(val)
+                        w.record(*record_values)
+
+        with open(f"{shapefile_path}.prj", "w") as prj_file:
+            prj_file.write(WGS84_PRJ)
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for ext in ['shp', 'shx', 'dbf', 'prj']:
+                filepath = os.path.join(temp_dir, f"{name}.{ext}")
+                if os.path.exists(filepath):
+                    zf.write(filepath, arcname=f"{name}.{ext}")
+        zip_buffer.seek(0)
+        return zip_buffer, "application/zip", f"{name}.zip"
+
+    elif output_format == 'gpkg':
+        gpkg_path = os.path.join(temp_dir, f"{name}.gpkg")
+        
+        # Determine geometry type from first valid feature
+        first_geom_type = None
+        with open(input_geojson_path, 'rb') as f:
+            features = ijson.items(f, 'features.item')
+            for feature in features:
+                geom = feature.get('geometry')
+                if geom and geom.get('type'):
+                    first_geom_type = geom.get('type')
+                    break
+        
+        if not first_geom_type:
+             raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
+
+        # Flattening logic implies we target the single type
+        target_geom_type = first_geom_type
+        if target_geom_type == 'MultiPolygon':
+            target_geom_type = 'Polygon'
+        elif target_geom_type == 'MultiLineString':
+            target_geom_type = 'LineString'
+
+        schema = {
+            'geometry': target_geom_type,
+            'properties': {}
+        }
+        
+        type_mapping = {
+            str: 'str',
+            int: 'int',
+            float: 'float',
+            bool: 'int'
+        }
+        
+        for key, val_type in properties_schema.items():
+            schema['properties'][key] = type_mapping.get(val_type, 'str')
+
+        with fiona.open(gpkg_path, 'w', driver='GPKG', schema=schema, crs=from_epsg(4326)) as sink:
+             with open(input_geojson_path, 'rb') as f:
+                features = ijson.items(f, 'features.item')
+                for feature in features:
+                    geom = feature.get('geometry')
+                    if not geom: continue
+                    
+                    geom_type = geom.get('type')
+                    coordinates = geom.get('coordinates')
+                    props = feature.get('properties', {})
+
+                    features_to_write = []
+                    if geom_type == 'MultiPolygon':
+                        for poly_coords in coordinates:
+                            features_to_write.append({
+                                'type': 'Feature',
+                                'geometry': {'type': 'Polygon', 'coordinates': poly_coords},
+                                'properties': props
+                            })
+                    elif geom_type == 'MultiLineString':
+                        for line_coords in coordinates:
+                            features_to_write.append({
+                                'type': 'Feature',
+                                'geometry': {'type': 'LineString', 'coordinates': line_coords},
+                                'properties': props
+                            })
+                    else:
+                        features_to_write.append(feature)
+
+                    for feat in features_to_write:
+                        # Validate geometry type matches schema
+                        if feat['geometry']['type'] != target_geom_type:
+                            continue
+                            
+                        # Convert bools
+                        if 'properties' in feat:
+                             feat['properties'] = {k: (int(v) if isinstance(v, bool) else v) for k, v in feat['properties'].items()}
+                        
+                        try:
+                            sink.write(feat)
+                        except Exception as e:
+                            logging.warning(f"Skipping feature due to write error: {e}")
+
+        return gpkg_path, "application/geopackage+sqlite3", f"{name}.gpkg"
 
 
-            with open(f"{shapefile_path}.prj", "w") as prj_file:
-                prj_file.write(WGS84_PRJ)
+@app.post("/convert")
+async def convert_geojson(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    format: Literal['shp', 'gpkg'] = Form('shp')
+):
+    if "/" in name or "\\" in name or ".." in name:
+        raise fastapi.HTTPException(status_code=400, detail="Invalid name.")
 
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for ext in ['shp', 'shx', 'dbf', 'prj']:
-                    filepath = os.path.join(temp_dir, f"{name}.{ext}")
-                    if os.path.exists(filepath):
-                        zf.write(filepath, arcname=f"{name}.{ext}")
-            zip_buffer.seek(0)
-
+    temp_dir = tempfile.mkdtemp()
+    input_geojson_path = os.path.join(temp_dir, "input.geojson")
+    
+    try:
+        # Stream upload to temp file
+        with open(input_geojson_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Offload CPU-bound conversion to threadpool
+        result = await run_in_threadpool(process_conversion, temp_dir, input_geojson_path, name, format)
+        
+        content, media_type, filename = result
+        
+        # If result is a path (GPKG), return FileResponse
+        if isinstance(content, str):
+             background_tasks.add_task(cleanup_temp_dir, temp_dir)
+             return FileResponse(
+                content,
+                media_type=media_type,
+                filename=filename,
+                background=background_tasks
+            )
+        else:
+            # If result is bytes buffer (Zip), return StreamingResponse
             background_tasks.add_task(cleanup_temp_dir, temp_dir)
             return StreamingResponse(
-                zip_buffer,
-                media_type="application/zip",
-                headers={"Content-Disposition": f'attachment; filename="{name}.zip"'},
+                content,
+                media_type=media_type,
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
                 background=background_tasks
             )
 
-        elif output_format == 'gpkg':
-            gpkg_path = os.path.join(temp_dir, f"{name}.gpkg")
-
-            # Determine schema from the first feature
-            first_feature = features[0]
-            first_geometry = first_feature.get('geometry', {})
-            first_properties = first_feature.get('properties', {})
-
-            if not first_geometry or 'type' not in first_geometry:
-                 raise fastapi.HTTPException(status_code=400, detail="First feature has no geometry or geometry type for GPKG.")
-
-            schema = {
-                'geometry': first_geometry.get('type'),
-                'properties': {k: type(v).__name__ for k, v in first_properties.items()}
-            }
-
-            # Replace type names with OGR types for Fiona
-            type_mapping = {
-                'str': 'str',
-                'int': 'int',
-                'float': 'float',
-                'bool': 'int'
-                # Add other mappings if necessary
-            }
-            schema['properties'] = {k: type_mapping.get(v, 'str') for k, v in schema['properties'].items()}
-            # Convert boolean property values to integers (0/1) in features
-            for feature in features:
-                if 'properties' in feature:
-                    feature['properties'] = {k: (int(v) if isinstance(v, bool) else v) for k, v in feature['properties'].items()}
-
-
-            with fiona.open(gpkg_path, 'w', driver='GPKG', schema=schema, crs=from_epsg(4326)) as sink:
-                for feature in features:
-                    # Ensure feature geometry matches the schema geometry type
-                    # This is a simplified check; robust validation might be needed
-                    if feature.get('geometry', {}).get('type') == schema['geometry']:
-                        try:
-                            sink.write(feature)
-                        except Exception as e:
-                            logging.warning(f"Skipping feature due to fiona write error: {e}. Feature: {feature}")
-                    else:
-                        logging.warning(f"Skipping feature with mismatched geometry for GPKG: {feature.get('geometry', {}).get('type')}")
-
-            background_tasks.add_task(cleanup_temp_dir, temp_dir)
-            return FileResponse(
-                gpkg_path,
-                media_type="application/geopackage+sqlite3", # Recommended MIME type
-                filename=f"{name}.gpkg", # Let FileResponse handle Content-Disposition quoting
-                # headers={"Content-Disposition": f'attachment; filename="{name}.gpkg"'}, # Manual override
-                background=background_tasks
-            )
-
+    except fastapi.HTTPException as e:
+        cleanup_temp_dir(temp_dir)
+        raise e
     except Exception as e:
-        logging.error(f"Exception during conversion: {e}")
-        # Clean up the temporary directory in case of an early exit due to error
-        # This immediate cleanup is important for non-FileResponse paths or errors before FileResponse
-        if os.path.exists(temp_dir):
-             shutil.rmtree(temp_dir)
-        raise fastapi.HTTPException(status_code=500, detail=f"An error occurred during conversion: {str(e)}")
+        cleanup_temp_dir(temp_dir)
+        logging.error(f"Error: {e}")
+        raise fastapi.HTTPException(status_code=500, detail=str(e))
