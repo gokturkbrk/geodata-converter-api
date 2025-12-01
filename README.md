@@ -26,7 +26,8 @@ A FastAPI application that converts GeoJSON data into zipped Shapefiles or GeoPa
 ## Requirements
 
 - Python 3.7+
-- See `requirements.txt` for dependencies.
+- Key Libraries: `fastapi`, `uvicorn`, `pyshp` (shapefile), `fiona`, `shapely` (implied)
+- See `requirements.txt` for full list of dependencies.
 
 ---
 
@@ -124,8 +125,9 @@ curl -X POST "http://127.0.0.1:8000/convert" \
 - **Geometry Handling:**  
   - Mixed `Polygon`/`MultiPolygon` and `LineString`/`MultiLineString` are flattened to single geometry types.
   - The output file's geometry type is determined by the first feature after flattening. Features with other geometry types are skipped.
-- **Properties Schema:**  
-  - Attribute fields are based on the first feature's properties.
+- **Properties Schema (IMPORTANT):**  
+  - **Schema Inference:** Attribute fields are defined solely based on the properties of the **first feature** in the collection.
+  - **Data Loss Risk:** If subsequent features contain properties that are not present in the first feature, those values will be **dropped**. Ensure your first feature contains all potential fields (even with null values) to avoid data loss.
   - Boolean properties are converted to integer fields (`0`/`1`) in GPKG output.
 - **Shapefile Field Names:**  
   - Field names are truncated to 10 characters due to the Shapefile format limitation.
@@ -147,6 +149,24 @@ curl -X POST "http://127.0.0.1:8000/convert" \
    ```bash
    pytest
    ```
+
+---
+
+## Deployment
+
+This application can be easily deployed using Docker.
+
+1. **Build the Docker image:**
+   ```bash
+   docker build -t geojson2shp-api .
+   ```
+
+2. **Run the Docker container:**
+   ```bash
+   docker run -p 80:80 geojson2shp-api
+   ```
+
+The API will be available at `http://localhost`.
 
 ---
 
