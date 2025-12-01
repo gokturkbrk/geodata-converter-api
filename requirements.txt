@@ -4,4 +4,5 @@ pyshp
 python-multipart
 pytest
 httpx
-fionaijson
+fiona
+ijson
