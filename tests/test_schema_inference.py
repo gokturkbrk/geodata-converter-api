@@ -32,7 +32,6 @@ def test_schema_inference_heterogeneous_features():
 
     # 1. Test Shapefile Conversion
     # Prepare GeoJSON file content
-    import json
     geojson_content = json.dumps(geojson).encode('utf-8')
     
     response = client.post("/convert", 
@@ -98,7 +97,6 @@ def test_schema_inference_type_promotion():
         ]
     }
 
-    import json
     geojson_content = json.dumps(geojson).encode('utf-8')
 
     response = client.post("/convert", 

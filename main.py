@@ -48,68 +48,101 @@ def cleanup_temp_dir(temp_dir_path: str):
 def infer_schema_streaming(input_path: str):
     """
     First pass: Stream through the file to infer schema from all features.
+    Returns (properties_schema, first_geometry_type)
     """
     properties_schema = {}
+    first_geom_type = None
     
-    with open(input_path, 'rb') as f:
-        # ijson.items yields objects from the stream. 
-        # We assume standard GeoJSON structure: root -> features -> item
-        features = ijson.items(f, 'features.item')
-        for feature in features:
-            props = feature.get('properties')
-            if not props:
-                continue
-            for key, value in props.items():
-                if value is None:
+    try:
+        with open(input_path, 'rb') as f:
+            # ijson.items yields objects from the stream. 
+            # We assume standard GeoJSON structure: root -> features -> item
+            features = ijson.items(f, 'features.item')
+            for feature in features:
+                # Capture first geometry type
+                if first_geom_type is None:
+                    geom = feature.get('geometry')
+                    if geom and geom.get('type'):
+                        first_geom_type = geom.get('type')
+                
+                props = feature.get('properties')
+                if not props:
                     continue
-                
-                # Normalize type
-                val_type = type(value)
-                if val_type == bool:
-                    val_type = int
-                elif val_type == Decimal:
-                    val_type = float
-                
-                current_type = properties_schema.get(key)
-                
-                if current_type is None:
-                    properties_schema[key] = val_type
-                elif current_type == val_type:
-                    continue
-                elif {current_type, val_type} <= {int, float}:
-                    properties_schema[key] = float
-                else:
-                    properties_schema[key] = str
+                for key, value in props.items():
+                    if value is None:
+                        continue
                     
-    return properties_schema
+                    # Normalize type
+                    val_type = type(value)
+                    if val_type == bool:
+                        val_type = int
+                    elif val_type == Decimal:
+                        val_type = float
+                    
+                    current_type = properties_schema.get(key)
+                    
+                    if current_type is None:
+                        properties_schema[key] = val_type
+                    elif current_type == val_type:
+                        continue
+                    elif {current_type, val_type} <= {int, float}:
+                        properties_schema[key] = float
+                    else:
+                        properties_schema[key] = str
+    except (ValueError, KeyError, ijson.JSONError) as e:
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail=f"Invalid GeoJSON format: {str(e)}"
+        )
+                    
+    return properties_schema, first_geom_type
+
+def flatten_multi_geometry(feature):
+    """
+    Helper function to flatten MultiPolygon and MultiLineString geometries.
+    Returns a list of flattened features.
+    """
+    geom = feature.get('geometry')
+    if not geom:
+        return []
+    
+    geom_type = geom.get('type')
+    coordinates = geom.get('coordinates')
+    props = feature.get('properties', {})
+    
+    if geom_type == 'MultiPolygon':
+        return [
+            {
+                'type': 'Feature',
+                'geometry': {'type': 'Polygon', 'coordinates': poly_coords},
+                'properties': props
+            }
+            for poly_coords in coordinates
+        ]
+    elif geom_type == 'MultiLineString':
+        return [
+            {
+                'type': 'Feature',
+                'geometry': {'type': 'LineString', 'coordinates': line_coords},
+                'properties': props
+            }
+            for line_coords in coordinates
+        ]
+    else:
+        return [feature]
 
 def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output_format: str):
     """
     Synchronous function to handle the CPU-bound conversion process.
     """
-    # 1. Infer Schema (Pass 1)
-    properties_schema = infer_schema_streaming(input_geojson_path)
+    # 1. Infer Schema and get first geometry type (Pass 1)
+    properties_schema, first_geom_type = infer_schema_streaming(input_geojson_path)
     
-    # We need to get the first geometry type to validate consistency
-    # We can do this by peeking or just checking during the second pass.
-    # For simplicity and efficiency, let's start the second pass.
+    if not first_geom_type:
+        raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
     
     if output_format == 'shp':
         shapefile_path = os.path.join(temp_dir, name)
-        
-        # We need to determine the shape type before opening the writer.
-        # Let's scan for the first valid geometry.
-        first_geom_type = None
-        with open(input_geojson_path, 'rb') as f:
-            features = ijson.items(f, 'features.item')
-            for feature in features:
-                geom = feature.get('geometry')
-                if geom and geom.get('type'):
-                    first_geom_type = geom.get('type')
-                    break
-        
-        if not first_geom_type:
-            raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
 
         shapetype_map = {
             "Point": shapefile.POINT,
@@ -134,8 +167,9 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
             raise fastapi.HTTPException(status_code=400, detail=f"Unsupported geometry type: {first_geom_type}")
 
         with shapefile.Writer(shapefile_path, shapeType=shape_type) as w:
-            # Define fields
-            field_names = []
+            # Define fields and maintain mapping
+            field_names = []  # Original property keys in order
+            field_name_map = {}  # Original key -> Shapefile field name
             seen_fields = set()
             
             for key, val_type in properties_schema.items():
@@ -150,6 +184,7 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
                 
                 seen_fields.add(final_name)
                 field_names.append(key)
+                field_name_map[key] = final_name
 
                 if val_type == int:
                     w.field(final_name, 'N')
@@ -162,32 +197,8 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
             with open(input_geojson_path, 'rb') as f:
                 features = ijson.items(f, 'features.item')
                 for feature in features:
-                    geom = feature.get('geometry')
-                    if not geom:
-                        continue
-                        
-                    geom_type = geom.get('type')
-                    coordinates = geom.get('coordinates')
-                    props = feature.get('properties', {})
-
-                    # Flattening Logic
-                    features_to_write = []
-                    if geom_type == 'MultiPolygon':
-                        for poly_coords in coordinates:
-                            features_to_write.append({
-                                'type': 'Feature',
-                                'geometry': {'type': 'Polygon', 'coordinates': poly_coords},
-                                'properties': props
-                            })
-                    elif geom_type == 'MultiLineString':
-                        for line_coords in coordinates:
-                            features_to_write.append({
-                                'type': 'Feature',
-                                'geometry': {'type': 'LineString', 'coordinates': line_coords},
-                                'properties': props
-                            })
-                    else:
-                        features_to_write.append(feature)
+                    # Use helper function for flattening
+                    features_to_write = flatten_multi_geometry(feature)
 
                     for feat in features_to_write:
                         f_geom = feat.get('geometry')
@@ -226,19 +237,6 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
 
     elif output_format == 'gpkg':
         gpkg_path = os.path.join(temp_dir, f"{name}.gpkg")
-        
-        # Determine geometry type from first valid feature
-        first_geom_type = None
-        with open(input_geojson_path, 'rb') as f:
-            features = ijson.items(f, 'features.item')
-            for feature in features:
-                geom = feature.get('geometry')
-                if geom and geom.get('type'):
-                    first_geom_type = geom.get('type')
-                    break
-        
-        if not first_geom_type:
-            raise fastapi.HTTPException(status_code=400, detail="No features with geometry found.")
 
         # Flattening logic implies we target the single type
         target_geom_type = first_geom_type
@@ -266,39 +264,21 @@ def process_conversion(temp_dir: str, input_geojson_path: str, name: str, output
              with open(input_geojson_path, 'rb') as f:
                 features = ijson.items(f, 'features.item')
                 for feature in features:
-                    geom = feature.get('geometry')
-                    if not geom: continue
-                    
-                    geom_type = geom.get('type')
-                    coordinates = geom.get('coordinates')
-                    props = feature.get('properties', {})
-
-                    features_to_write = []
-                    if geom_type == 'MultiPolygon':
-                        for poly_coords in coordinates:
-                            features_to_write.append({
-                                'type': 'Feature',
-                                'geometry': {'type': 'Polygon', 'coordinates': poly_coords},
-                                'properties': props
-                            })
-                    elif geom_type == 'MultiLineString':
-                        for line_coords in coordinates:
-                            features_to_write.append({
-                                'type': 'Feature',
-                                'geometry': {'type': 'LineString', 'coordinates': line_coords},
-                                'properties': props
-                            })
-                    else:
-                        features_to_write.append(feature)
+                    # Use helper function for flattening
+                    features_to_write = flatten_multi_geometry(feature)
 
                     for feat in features_to_write:
                         # Validate geometry type matches schema
                         if feat['geometry']['type'] != target_geom_type:
                             continue
                         
-                        # Convert bools
+                        # Convert bools and Decimals
                         if 'properties' in feat:
-                            feat['properties'] = {k: (int(v) if isinstance(v, bool) else v) for k, v in feat['properties'].items()}
+                            feat['properties'] = {
+                                k: (int(v) if isinstance(v, bool) else 
+                                    float(v) if isinstance(v, Decimal) else v)
+                                for k, v in feat['properties'].items()
+                            }
                         
                         try:
                             sink.write(feat)
@@ -317,14 +297,25 @@ async def convert_geojson(
 ):
     if "/" in name or "\\" in name or ".." in name:
         raise fastapi.HTTPException(status_code=400, detail="Invalid name.")
+    
+    # Validate file size (50MB limit)
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+    file_size = 0
 
     temp_dir = tempfile.mkdtemp()
     input_geojson_path = os.path.join(temp_dir, "input.geojson")
     
     try:
-        # Stream upload to temp file
+        # Stream upload to temp file with size validation
         with open(input_geojson_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while chunk := await file.read(8192):  # Read in 8KB chunks
+                file_size += len(chunk)
+                if file_size > MAX_FILE_SIZE:
+                    raise fastapi.HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"
+                    )
+                buffer.write(chunk)
         
         # Offload CPU-bound conversion to threadpool
         result = await run_in_threadpool(process_conversion, temp_dir, input_geojson_path, name, format)
@@ -350,10 +341,13 @@ async def convert_geojson(
                 background=background_tasks
             )
 
-    except fastapi.HTTPException as e:
+    except fastapi.HTTPException:
         cleanup_temp_dir(temp_dir)
-        raise e
+        raise
     except Exception as e:
         cleanup_temp_dir(temp_dir)
         logging.error(f"Error: {e}")
+        # Check if the exception is actually an HTTPException from threadpool
+        if isinstance(e, fastapi.HTTPException):
+            raise
         raise fastapi.HTTPException(status_code=500, detail=str(e))
