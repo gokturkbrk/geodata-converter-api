@@ -70,42 +70,23 @@ Interactive documentation is available at [http://127.0.0.1:8000/docs](http://12
 
 ### Endpoint
 
-`POST /convert`
+### Request
+**Method:** `POST /convert`  
+**Content-Type:** `multipart/form-data`
 
-### Request Body
-
-```json
-{
-  "geojson": { ... },   // A valid GeoJSON FeatureCollection
-  "name": "output_name", // Desired base name for output files (no slashes or '..')
-  "format": "shp"        // Optional: "shp" (default) or "gpkg"
-}
-```
+**Parameters:**
+- `file`: The GeoJSON file to convert (Upload).
+- `name`: Desired base name for output files (string).
+- `format`: Optional. `shp` (default) or `gpkg`.
 
 ### Example Request
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/convert" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "geojson": {
-      "type": "FeatureCollection",
-      "features": [
-        {
-          "type": "Feature",
-          "geometry": { "type": "Polygon", "coordinates": [[[0,0],[0,1],[1,1],[0,0]]] },
-          "properties": { "id": 1, "active": true }
-        },
-        {
-          "type": "Feature",
-          "geometry": { "type": "MultiPolygon", "coordinates": [[[[10,10],[10,11],[11,11],[10,10]]]] },
-          "properties": { "id": 2, "active": false }
-        }
-      ]
-    },
-    "name": "my_shapes",
-    "format": "gpkg"
-  }' --output my_shapes.gpkg
+  -F "file=@/path/to/data.geojson" \
+  -F "name=my_shapes" \
+  -F "format=gpkg" \
+  --output my_shapes.gpkg
 ```
 
 ### Response
@@ -125,9 +106,11 @@ curl -X POST "http://127.0.0.1:8000/convert" \
 - **Geometry Handling:**  
   - Mixed `Polygon`/`MultiPolygon` and `LineString`/`MultiLineString` are flattened to single geometry types.
   - The output file's geometry type is determined by the first feature after flattening. Features with other geometry types are skipped.
-- **Properties Schema (IMPORTANT):**  
-  - **Schema Inference:** Attribute fields are defined solely based on the properties of the **first feature** in the collection.
-  - **Data Loss Risk:** If subsequent features contain properties that are not present in the first feature, those values will be **dropped**. Ensure your first feature contains all potential fields (even with null values) to avoid data loss.
+- **Properties Schema:**  
+  - **Schema Inference:** Attribute fields are inferred from **all features** in the collection.
+  - **Type Handling:** 
+    - Mixed `int` and `float` are promoted to `float`.
+    - Mixed types (e.g. `int` and `str`) are promoted to `str`.
   - Boolean properties are converted to integer fields (`0`/`1`) in GPKG output.
 - **Shapefile Field Names:**  
   - Field names are truncated to 10 characters due to the Shapefile format limitation.

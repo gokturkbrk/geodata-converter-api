@@ -14,14 +14,10 @@ This project provides a FastAPI-based API to convert GeoJSON data into either Sh
 
 ### `POST /convert`
 
-**Input (JSON):**
-```json
-{
-  "geojson": { "type": "FeatureCollection", "features": [...] },
-  "name": "output_filename_base",
-  "format": "shp" // or "gpkg"
-}
-```
+**Input (Multipart/Form-Data):**
+- `file`: GeoJSON file.
+- `name`: Output filename base.
+- `format`: `shp` or `gpkg`.
 
 **Output:**
 - Binary file stream (`application/zip` or `application/geopackage+sqlite3`).

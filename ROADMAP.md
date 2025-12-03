@@ -4,12 +4,12 @@ This document outlines the development roadmap for the `geojson2shp-api` project
 
 ## 1. Critical Bug Fixes & Stability
 
-### Fix Schema Inference (High Priority)
+### Fix Schema Inference (Completed)
 - **Problem**: Currently, the output schema (fields) is determined solely by the *first* feature in the GeoJSON. If subsequent features have fields that the first one doesn't, those fields are silently dropped.
 - **Solution**: Implement a two-pass approach:
     1.  Iterate through all features to collect a superset of all properties and their types.
     2.  Write the output file using this unified schema.
-- **Benefit**: Prevents data loss for heterogeneous GeoJSON inputs.
+- **Status**: ✅ **Fixed**. Implemented two-pass schema inference.
 
 ### Robust Geometry Validation (Medium Priority)
 - **Problem**: The converter assumes all features match the geometry type of the first feature. Mismatched geometries are skipped/logged but this behavior might be too aggressive for some users.
@@ -31,10 +31,10 @@ This document outlines the development roadmap for the `geojson2shp-api` project
 
 ## 3. Enhancements & Performance
 
-### Non-Blocking I/O (High Priority)
+### Non-Blocking I/O (Completed)
 - **Problem**: `shapefile` and `fiona` writes are synchronous and blocking. This blocks the main thread of the FastAPI application, making it unresponsive to other requests during large conversions.
-- **Solution**: Wrap file writing operations in `fastapi.concurrency.run_in_threadpool` or use `asyncio.to_thread`.
-- **Benefit**: drastically improves concurrency and responsiveness under load.
+- **Solution**: Refactored to use `run_in_threadpool` for CPU-bound conversion tasks.
+- **Status**: ✅ **Fixed**. Conversion now runs in a thread pool, keeping the main event loop responsive.
 
 ### Docker Optimization (Low Priority)
 - **Problem**: Current Dockerfile might be using a heavy base image or not utilizing build stages.
