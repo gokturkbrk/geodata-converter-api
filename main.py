@@ -347,7 +347,4 @@ async def convert_geojson(
     except Exception as e:
         cleanup_temp_dir(temp_dir)
         logging.error(f"Error: {e}")
-        # Check if the exception is actually an HTTPException from threadpool
-        if isinstance(e, fastapi.HTTPException):
-            raise
         raise fastapi.HTTPException(status_code=500, detail=str(e))
