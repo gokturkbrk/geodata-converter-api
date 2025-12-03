@@ -84,7 +84,7 @@ def test_schema_inference_type_promotion():
                 "geometry": {"type": "Point", "coordinates": [1, 1]},
                 "properties": {"mixed_num": 1.5} # float
             },
-             {
+            {
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [2, 2]},
                 "properties": {"mixed_str": 10} 

@@ -328,8 +328,8 @@ async def convert_geojson(
         
         # If result is a path (GPKG), return FileResponse
         if isinstance(content, str):
-             background_tasks.add_task(cleanup_temp_dir, temp_dir)
-             return FileResponse(
+            background_tasks.add_task(cleanup_temp_dir, temp_dir)
+            return FileResponse(
                 content,
                 media_type=media_type,
                 filename=filename,
