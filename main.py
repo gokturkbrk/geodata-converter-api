@@ -110,6 +110,10 @@ def flatten_multi_geometry(feature):
     coordinates = geom.get('coordinates')
     props = feature.get('properties', {})
     
+    # Validate coordinates exist
+    if not coordinates:
+        return []
+    
     if geom_type == 'MultiPolygon':
         return [
             {
